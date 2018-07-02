@@ -1,27 +1,51 @@
-import cwltool
-import cwltool.factory
+# -*- coding: utf-8 -*
 import argparse
-import cwltool.argparser
+import codecs
 import sys
-import six
 
+import io
+import six
+import logging
 import os
-from cwltool import load_tool, workflow
-from cwltool.executors import SingleJobExecutor
-from typing import Callable
-from cwltool.argparser import arg_parser, generate_parser, DEFAULT_TMP_PREFIX
-from cwltool.main import main
+import pkg_resources
+import functools
+
+import ruamel.yaml as yaml
+import schema_salad.validate as validate
+from cwltool import workflow
+from cwltool import command_line_tool
+
+from schema_salad.ref_resolver import Loader, file_uri, uri_file_path
+from schema_salad.sourceline import strip_dup_lineno
+from typing import Callable, cast, TextIO
+from six import string_types
+
+from cwltool.argparser import arg_parser, generate_parser, DEFAULT_TMP_PREFIX, get_default_args
+from cwltool.cwlrdf import printdot, printrdf
+from cwltool.context import  LoadingContext, RuntimeContext, getdefault
+from cwltool.errors import UnsupportedRequirement, WorkflowException
+from cwltool.main import MultithreadedJobExecutor, SingleJobExecutor
 from cwltool.load_tool import (FetcherConstructorType, resolve_tool_uri,
                         fetch_document, make_tool, validate_document, jobloaderctx,
                         resolve_overrides, load_overrides)
+from cwltool.loghandler import defaultStreamHandler
+from cwltool.mutation import MutationManager
+from cwltool.pathmapper import (adjustDirObjs, trim_listing, visit_class)
+from cwltool.process import (Process, normalizeFilesDirs,
+                      scandeps, shortname, use_custom_schema,
+                      use_standard_schema)
 from cwltool.resolver import ga4gh_tool_registries, tool_resolver
+from cwltool.software_requirements import (DependenciesConfiguration,
+                                    get_container_from_software_requirements)
 from cwltool.stdfsaccess import StdFsAccess
-from cwltool.main import init_job_order, load_job_order
-
+from cwltool.utils import onWindows, windows_default_container_id, json_dumps
+from cwltool.main import supportedCWLversions, printdeps, find_default_container, generate_input_template, print_pack, versionstring,init_job_order, load_job_order
+from cwltool.secrets import SecretStore
 
 
 from ipykernel.kernelbase import Kernel
 
+_logger = logging.getLogger("cwltool")
 
 class cwl_kernel(Kernel):
 
@@ -37,71 +61,327 @@ class cwl_kernel(Kernel):
 
     banner = "cwlKernel"
     CWLFILEPATH = None
+    PREINPUT = []
 
-    def cwlengine(self,argslist):
+    def cwlmain(self,
+              argsl=None,  # type: List[str]
+             args=None,  # type: argparse.Namespace
+             job_order_object=None,  # type: MutableMapping[Text, Any]
+             stdin=sys.stdin,  # type: IO[Any]
+             stdout=None,  # type: Union[TextIO, codecs.StreamWriter]
+             stderr=sys.stderr,  # type: IO[Any]
+             versionfunc=versionstring,  # type: Callable[[], Text]
+             logger_handler=None,  #
+             custom_schema_callback=None,  # type: Callable[[], None]
+             executor=None,  # type: Callable[..., Tuple[Dict[Text, Any], Text]]
+             loadingContext=None,  # type: LoadingContext
+             runtimeContext=None  # type: RuntimeContext
+             ):  # type: (...) -> int
+        if not stdout:  # force UTF-8 even if the console is configured differently
+            if (hasattr(sys.stdout, "encoding")  # type: ignore
+                and sys.stdout.encoding != 'UTF-8'):  # type: ignore
+                if six.PY3 and hasattr(sys.stdout, "detach"):
+                    stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+                else:
+                    stdout = codecs.getwriter('utf-8')(sys.stdout)  # type: ignore
+            else:
+                stdout = cast(TextIO, sys.stdout)  # type: ignore
 
-        fetcher_constructor = None
-        resolver = tool_resolver
-        overrides = []
-        executor = SingleJobExecutor()
-        make_fs_access = StdFsAccess
-
-        argslist = argslist
-        args = arg_parser().parse_args(argslist)
-
-        make_tool_kwds = vars(args)
-        uri, tool_file_uri = resolve_tool_uri(args.workflow,
-                                              resolver=resolver,
-                                              fetcher_constructor=fetcher_constructor)
-        stdin = sys.stdin
-        job_order_object, input_basedir, jobloader = load_job_order(args,
-                                                                    stdin,
-                                                                    fetcher_constructor,
-                                                                    overrides,
-                                                                    tool_file_uri)
-
-        document_loader, workflowobj, uri = fetch_document(uri, resolver=resolver,
-                                                           fetcher_constructor=fetcher_constructor)
+        _logger.removeHandler(defaultStreamHandler)
+        if logger_handler:
+            stderr_handler = logger_handler
+        else:
+            stderr_handler = logging.StreamHandler(stderr)
+        _logger.addHandler(stderr_handler)
         try:
-            document_loader, avsc_names, processobj, metadata, uri \
-                = validate_document(document_loader, workflowobj, uri,
-                                    enable_dev=args.enable_dev, strict=args.strict,
-                                    preprocess_only=args.print_pre or args.pack,
-                                    fetcher_constructor=fetcher_constructor,
-                                    skip_schemas=args.skip_schemas,
-                                    overrides=overrides)
-        except Exception as e:
-            return str(e)
+            if args is None:
+                if argsl is None:
+                    argsl = sys.argv[1:]
+                args = arg_parser().parse_args(argsl)
 
-        makeTool = workflow.defaultMakeTool
-        setattr(args, 'overrides', [])
+            if runtimeContext is None:
+                runtimeContext = RuntimeContext(vars(args))
+            else:
+                runtimeContext = runtimeContext.copy()
 
-        tool = make_tool(document_loader, avsc_names, metadata, uri,
-                         makeTool, kwargs=make_tool_kwds)
-        setattr(args, 'basedir', args.outdir)
-        try:
-            job_order_object = init_job_order(job_order_object, args, tool,
-                                              print_input_deps=args.print_input_deps,
-                                              relative_deps=args.relative_deps,
-                                              stdout=sys.stdout,
-                                              make_fs_access=make_fs_access,
-                                              loader=jobloader,
-                                              input_basedir=input_basedir
-                                              )
+            # If on Windows platform, a default Docker Container is used if not
+            # explicitely provided by user
+            if onWindows() and not runtimeContext.default_container:
+                # This docker image is a minimal alpine image with bash installed
+                # (size 6 mb). source: https://github.com/frol/docker-alpine-bash
+                runtimeContext.default_container = windows_default_container_id
 
-        except SystemExit as e:
-            return str(e)
-        del args.job_order
-        del args.workflow
-        (out, status) = executor(tool, job_order_object,
-                                 logger=None,
-                                 makeTool=makeTool,
-                                 select_resources=None,
-                                 make_fs_access=make_fs_access,
-                                 secret_store={},
-                                 **vars(args))
-        return out
+            # If caller parsed its own arguments, it may not include every
+            # cwltool option, so fill in defaults to avoid crashing when
+            # dereferencing them in args.
+            for key, val in six.iteritems(get_default_args()):
+                if not hasattr(args, key):
+                    setattr(args, key, val)
 
+            rdflib_logger = logging.getLogger("rdflib.term")
+            rdflib_logger.addHandler(stderr_handler)
+            rdflib_logger.setLevel(logging.ERROR)
+            if args.quiet:
+                _logger.setLevel(logging.WARN)
+            if runtimeContext.debug:
+                _logger.setLevel(logging.DEBUG)
+                rdflib_logger.setLevel(logging.DEBUG)
+            if args.timestamps:
+                formatter = logging.Formatter("[%(asctime)s] %(message)s",
+                                              "%Y-%m-%d %H:%M:%S")
+                stderr_handler.setFormatter(formatter)
+
+            if args.version:
+                print(versionfunc())
+                return 0
+            else:
+                _logger.info(versionfunc())
+
+            if args.print_supported_versions:
+                print("\n".join(supportedCWLversions(args.enable_dev)))
+                return 0
+
+            if not args.workflow:
+                if os.path.isfile("CWLFile"):
+                    setattr(args, "workflow", "CWLFile")
+                else:
+                    _logger.error("")
+                    _logger.error("CWL document required, no input file was provided")
+                    arg_parser().print_help()
+                    return 1
+            if args.relax_path_checks:
+                command_line_tool.ACCEPTLIST_RE = command_line_tool.ACCEPTLIST_EN_RELAXED_RE
+
+            if args.ga4gh_tool_registries:
+                ga4gh_tool_registries[:] = args.ga4gh_tool_registries
+            if not args.enable_ga4gh_tool_registry:
+                del ga4gh_tool_registries[:]
+
+            if custom_schema_callback:
+                custom_schema_callback()
+            elif args.enable_ext:
+                res = pkg_resources.resource_stream(__name__, 'extensions.yml')
+                use_custom_schema("v1.0", "http://commonwl.org/cwltool", res.read())
+                res.close()
+            else:
+                use_standard_schema("v1.0")
+
+            if loadingContext is None:
+                loadingContext = LoadingContext(vars(args))
+            else:
+                loadingContext = loadingContext.copy()
+
+            loadingContext.disable_js_validation = \
+                args.disable_js_validation or (not args.do_validate)
+            loadingContext.construct_tool_object = getdefault(loadingContext.construct_tool_object,
+                                                              workflow.default_make_tool)
+            loadingContext.resolver = getdefault(loadingContext.resolver, tool_resolver)
+
+            uri, tool_file_uri = resolve_tool_uri(args.workflow,
+                                                  resolver=loadingContext.resolver,
+                                                  fetcher_constructor=loadingContext.fetcher_constructor)
+
+            try_again_msg = "" if args.debug else ", try again with --debug for more information"
+
+            try:
+                job_order_object, input_basedir, jobloader = load_job_order(
+                    args, stdin, loadingContext.fetcher_constructor,
+                    loadingContext.overrides_list, tool_file_uri)
+
+                if args.overrides:
+                    loadingContext.overrides_list.extend(load_overrides(
+                        file_uri(os.path.abspath(args.overrides)), tool_file_uri))
+
+                document_loader, workflowobj, uri = fetch_document(
+                    uri, resolver=loadingContext.resolver,
+                    fetcher_constructor=loadingContext.fetcher_constructor)
+
+                if args.print_deps:
+                    printdeps(workflowobj, document_loader, stdout, args.relative_deps, uri)
+                    return 0
+
+                document_loader, avsc_names, processobj, metadata, uri \
+                    = validate_document(document_loader, workflowobj, uri,
+                                        enable_dev=loadingContext.enable_dev,
+                                        strict=loadingContext.strict,
+                                        preprocess_only=(args.print_pre or args.pack),
+                                        fetcher_constructor=loadingContext.fetcher_constructor,
+                                        skip_schemas=args.skip_schemas,
+                                        overrides=loadingContext.overrides_list,
+                                        do_validate=loadingContext.do_validate)
+
+                if args.print_pre:
+                    stdout.write(json_dumps(processobj, indent=4))
+                    return 0
+
+                loadingContext.overrides_list.extend(metadata.get("cwltool:overrides", []))
+
+                tool = make_tool(document_loader, avsc_names,
+                                 metadata, uri, loadingContext)
+                if args.make_template:
+                    yaml.safe_dump(generate_input_template(tool), sys.stdout,
+                                   default_flow_style=False, indent=4,
+                                   block_seq_indent=2)
+                    return 0
+
+                if args.validate:
+                    _logger.info("Tool definition is valid")
+                    return 0
+
+                if args.pack:
+                    stdout.write(print_pack(document_loader, processobj, uri, metadata))
+                    return 0
+
+                if args.print_rdf:
+                    stdout.write(printrdf(tool, document_loader.ctx, args.rdf_serializer))
+                    return 0
+
+                if args.print_dot:
+                    printdot(tool, document_loader.ctx, stdout)
+                    return 0
+
+            except (validate.ValidationException) as exc:
+                _logger.error(u"Tool definition failed validation:\n%s", exc,
+                              exc_info=args.debug)
+                return 1
+            except (RuntimeError, WorkflowException) as exc:
+                _logger.error(u"Tool definition failed initialization:\n%s", exc,
+                              exc_info=args.debug)
+                return 1
+            except Exception as exc:
+                _logger.error(
+                    u"I'm sorry, I couldn't load this CWL file%s.\nThe error was: %s",
+                    try_again_msg,
+                    exc if not args.debug else "",
+                    exc_info=args.debug)
+                return 1
+
+            if isinstance(tool, int):
+                return tool
+
+            # If on MacOS platform, TMPDIR must be set to be under one of the
+            # shared volumes in Docker for Mac
+            # More info: https://dockstore.org/docs/faq
+            if sys.platform == "darwin":
+                default_mac_path = "/private/tmp/docker_tmp"
+                if runtimeContext.tmp_outdir_prefix == DEFAULT_TMP_PREFIX:
+                    runtimeContext.tmp_outdir_prefix = default_mac_path
+
+            for dirprefix in ("tmpdir_prefix", "tmp_outdir_prefix", "cachedir"):
+                if getattr(runtimeContext, dirprefix) and getattr(runtimeContext, dirprefix) != DEFAULT_TMP_PREFIX:
+                    sl = "/" if getattr(runtimeContext, dirprefix).endswith("/") or dirprefix == "cachedir" \
+                        else ""
+                    setattr(runtimeContext, dirprefix,
+                            os.path.abspath(getattr(runtimeContext, dirprefix)) + sl)
+                    if not os.path.exists(os.path.dirname(getattr(runtimeContext, dirprefix))):
+                        try:
+                            os.makedirs(os.path.dirname(getattr(runtimeContext, dirprefix)))
+                        except Exception as e:
+                            _logger.error("Failed to create directory: %s", e)
+                            return 1
+
+            if args.cachedir:
+                if args.move_outputs == "move":
+                    runtimeContext.move_outputs = "copy"
+                runtimeContext.tmp_outdir_prefix = args.cachedir
+
+            runtimeContext.secret_store = getdefault(runtimeContext.secret_store, SecretStore())
+
+            initialized_job_order_object = 255  # type: Union[MutableMapping[Text, Any], int]
+            try:
+                initialized_job_order_object = init_job_order(job_order_object, args, tool,
+                                                              jobloader, stdout,
+                                                              print_input_deps=args.print_input_deps,
+                                                              relative_deps=args.relative_deps,
+                                                              input_basedir=input_basedir,
+                                                              secret_store=runtimeContext.secret_store)
+            except SystemExit as err:
+                return err.code
+
+            if not executor:
+                if args.parallel:
+                    executor = MultithreadedJobExecutor()
+                else:
+                    executor = SingleJobExecutor()
+            assert executor is not None
+
+            if isinstance(initialized_job_order_object, int):
+                return initialized_job_order_object
+
+            try:
+                runtimeContext.basedir = input_basedir
+                del args.workflow
+                del args.job_order
+
+                conf_file = getattr(args, "beta_dependency_resolvers_configuration", None)  # Text
+                use_conda_dependencies = getattr(args, "beta_conda_dependencies", None)  # Text
+
+                job_script_provider = None  # type: Optional[DependenciesConfiguration]
+                if conf_file or use_conda_dependencies:
+                    runtimeContext.job_script_provider = DependenciesConfiguration(args)
+
+                runtimeContext.find_default_container = \
+                    functools.partial(find_default_container, args)
+                runtimeContext.make_fs_access = getdefault(runtimeContext.make_fs_access, StdFsAccess)
+
+                (out, status) = executor(tool,
+                                         initialized_job_order_object,
+                                         runtimeContext,
+                                         logger=_logger)
+
+                # This is the workflow output, it needs to be written
+                if out is not None:
+
+                    def loc_to_path(obj):
+                        for field in ("path", "nameext", "nameroot", "dirname"):
+                            if field in obj:
+                                del obj[field]
+                        if obj["location"].startswith("file://"):
+                            obj["path"] = uri_file_path(obj["location"])
+
+                    visit_class(out, ("File", "Directory"), loc_to_path)
+
+                    # Unsetting the Generation fron final output object
+                    visit_class(out, ("File",), MutationManager().unset_generation)
+
+                    if isinstance(out, string_types):
+                        stdout.write(out)
+                    else:
+                        stdout.write(json_dumps(out, indent=4,  # type: ignore
+                                                ensure_ascii=False))
+                    stdout.write("\n")
+                    if hasattr(stdout, "flush"):
+                        stdout.flush()  # type: ignore
+
+                if status != "success":
+                    _logger.warning(u"Final process status is %s", status)
+                    return 1
+
+                _logger.info(u"Final process status is %s", status)
+                return out,"success"
+
+            except (validate.ValidationException) as exc:
+                _logger.error(u"Input object failed validation:\n%s", exc,
+                              exc_info=args.debug)
+                return 1
+            except UnsupportedRequirement as exc:
+                _logger.error(
+                    u"Workflow or tool uses unsupported feature:\n%s", exc,
+                    exc_info=args.debug)
+                return 33
+            except WorkflowException as exc:
+                _logger.error(
+                    u"Workflow error%s:\n%s", try_again_msg, strip_dup_lineno(six.text_type(exc)),
+                    exc_info=args.debug)
+                return 1
+            except Exception as exc:
+                _logger.error(
+                    u"Unhandled error%s:\n  %s", try_again_msg, exc, exc_info=args.debug)
+                return 1
+
+        finally:
+            _logger.removeHandler(stderr_handler)
+            _logger.addHandler(defaultStreamHandler)
 
 
     def do_execute(self, code, silent, store_history=True,
@@ -109,51 +389,69 @@ class cwl_kernel(Kernel):
 
         sys.argv[1] = None
         sys.stderr = sys.__stderr__
-        code = code.encode('unicode-escape').decode('string_escape')
-        inputfield = code.split()
-        out = None
-        if os.path.splitext(inputfield[0])[1] == '.cwl' and self.CWLFILEPATH:
-            self.CWLFILEPATH = None
-        if self.CWLFILEPATH:
-            if os.path.splitext(inputfield[0])[1] in [".yaml", ".json"]:
-                out = self.cwlengine(inputfield)
-                if isinstance(out,dict):
-                    self.CWLFILEPATH = None
-                else:
-                    argslist = [self.CWLFILEPATH]
-                    argslist.extend(inputfield)
-                    out = self.cwlengine(argslist)
-            else:
-                argslist = [self.CWLFILEPATH]
-                argslist.extend(inputfield)
-                out = self.cwlengine(argslist)
-        else:
-            houzhui = os.path.splitext(inputfield[0])[1]
-            if len(inputfield)==1 :
-                if os.path.splitext(inputfield[0])[1] == '.cwl':
-                    out = self.cwlengine(inputfield)
-                    if out == "2":
-                        self.CWLFILEPATH = inputfield[0]
-                        out = "require data file"
-                elif os.path.splitext(inputfield[0])[1] in [".yaml",".json"]:
-                    out = self.cwlengine(inputfield)
-                else:
-                    self.send_response(self.iopub_socket, 'stream', 'cwl, json, yaml files are required.')
-            else:
-                out = self.cwlengine(inputfield)
+        # code = code.encode('unicode-escape').decode('string_escape')
+        if code in ['clear','new']:
+            self.PREINPUT = []
+        if not silent:
+            inputfield = code.split()
+            # 遍历输入域
+            for item in inputfield:
+                if os.path.splitext(item)[1] == '.cwl':
+                    # 更新CWL文件
+                    self.CWLFILEPATH = item
+            # 输入域和记录中都没有cwl文件，则在数据文件中寻找cwl地址
+            if not self.CWLFILEPATH:
+                for item in inputfield:
+                    if os.path.splitext(item)[1] in [".yaml", ".json"]:
+                        try:
+                            f = open(item,'r')
+                            text = f.read()
+                            if 'cwl:tool' in text:
+                            # 自动导入CWL的数据文件
+                            # 抹掉CWL记录
+                                self.CWLFILEPATH = "cwl:tool"
+                        except IOError as e:
+                            _logger.error('data file cannot open')
+                    else:
+                        self.PREINPUT.append(item)
 
-        if isinstance(out,dict):
-            outputname = out.keys()[0]
-            if isinstance(out[outputname],dict):
-                outputpath = out[outputname]['location'][7:]
-                with open(outputpath) as file_object:
-                    contents = file_object.read()
+            # 如果有记录，而且inputfiled里面没有cwl，加入cwl
+            elif self.CWLFILEPATH:
+                if self.CWLFILEPATH not in inputfield and self.CWLFILEPATH != "cwl:tool":
+                    inputfield.insert(0, self.CWLFILEPATH)
+                for i in self.PREINPUT:
+                    inputfield.append(i)
+            if self.CWLFILEPATH:
+                result,status = self.cwlmain(inputfield)
             else:
-                contents = out[outputname]
-        else:
-            contents = out
-        stream_content = {'name': 'stdout', 'text': contents}
-        self.send_response(self.iopub_socket, 'stream', stream_content)
+                result = "data file/ cwl file required."
+                status = "error"
+            print('finished!!')
+            if status == "success":
+                self.PREINPUT = []
+                contents = result
+            else:
+                contents = result
+
+            # output: File
+            # open output file
+
+            if isinstance(contents,dict) and status == "success":
+                for file in contents:
+                    if isinstance(contents[file], dict):
+                        filepath = contents[file]['path']
+                        f = open(filepath, 'r')
+                        text = f.read()
+                        if len(text)>1000:
+                            output = text[:1000] + "\n" + contents[file]['path'] + "\n\n"
+                        else:
+                            output = text
+            else:
+                output = contents
+
+            stream_content = {'name': 'stdout', 'text': output}
+            self.send_response(self.iopub_socket, 'stream', stream_content)
+
 
         return {'status': 'ok',
                 'execution_count': self.execution_count,
