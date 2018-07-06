@@ -9,6 +9,7 @@ import logging
 import os
 import pkg_resources
 import functools
+import datetime
 
 import ruamel.yaml as yaml
 import schema_salad.validate as validate
@@ -21,7 +22,7 @@ from typing import Callable, cast, TextIO
 from six import string_types
 
 from cwltool.argparser import arg_parser, generate_parser, DEFAULT_TMP_PREFIX, get_default_args
-from cwltool.cwlrdf import printdot, printrdf
+from cwltool.cwlrdf import printdot, printrdf, gather
 from cwltool.context import  LoadingContext, RuntimeContext, getdefault
 from cwltool.errors import UnsupportedRequirement, WorkflowException
 from cwltool.main import MultithreadedJobExecutor, SingleJobExecutor
@@ -41,11 +42,47 @@ from cwltool.stdfsaccess import StdFsAccess
 from cwltool.utils import onWindows, windows_default_container_id, json_dumps
 from cwltool.main import supportedCWLversions, printdeps, find_default_container, generate_input_template, print_pack, versionstring,init_job_order, load_job_order
 from cwltool.secrets import SecretStore
+from cwltool.main import make_relative
+from cwltool.cwlrdf import dot_with_parameters, dot_without_parameters
+from cwltool.factory import Factory
 
+from metakernel import MetaKernel
 
 from ipykernel.kernelbase import Kernel
 
 _logger = logging.getLogger("cwltool")
+
+def returndeps(obj,              # type: Optional[Mapping[Text, Any]]
+              document_loader,  # type: Loader
+              stdout,           # type: Union[TextIO, StreamWriter]
+              relative_deps,    # type: bool
+              uri,              # type: Text
+              basedir=None      # type: Text
+             ):  # type: (...) -> None
+    """Print a JSON representation of the dependencies of the CWL document."""
+    deps = {"class": "File", "location": uri}  # type: Dict[Text, Any]
+
+    def loadref(base, uri):
+        return document_loader.fetch(document_loader.fetcher.urljoin(base, uri))
+
+    sfs = scandeps(
+        basedir if basedir else uri, obj, {"$import", "run"},
+        {"$include", "$schemas", "location"}, loadref)
+    if sfs:
+        deps["secondaryFiles"] = sfs
+
+    if relative_deps:
+        if relative_deps == "primary":
+            base = basedir if basedir else os.path.dirname(uri_file_path(str(uri)))
+        elif relative_deps == "cwd":
+            base = os.getcwd()
+        else:
+            raise Exception(u"Unknown relative_deps %s" % relative_deps)
+
+        visit_class(deps, ("File", "Directory"), functools.partial(make_relative, base))
+
+    return json_dumps(deps, indent=4)
+
 
 class cwl_kernel(Kernel):
 
@@ -64,19 +101,19 @@ class cwl_kernel(Kernel):
     PREINPUT = []
 
     def cwlmain(self,
-              argsl=None,  # type: List[str]
-             args=None,  # type: argparse.Namespace
-             job_order_object=None,  # type: MutableMapping[Text, Any]
-             stdin=sys.stdin,  # type: IO[Any]
-             stdout=None,  # type: Union[TextIO, codecs.StreamWriter]
-             stderr=sys.stderr,  # type: IO[Any]
-             versionfunc=versionstring,  # type: Callable[[], Text]
-             logger_handler=None,  #
-             custom_schema_callback=None,  # type: Callable[[], None]
-             executor=None,  # type: Callable[..., Tuple[Dict[Text, Any], Text]]
-             loadingContext=None,  # type: LoadingContext
-             runtimeContext=None  # type: RuntimeContext
-             ):  # type: (...) -> int
+                argsl=None,  # type: List[str]
+                args=None,  # type: argparse.Namespace
+                job_order_object=None,  # type: MutableMapping[Text, Any]
+                stdin=sys.stdin,  # type: IO[Any]
+                stdout=None,  # type: Union[TextIO, codecs.StreamWriter]
+                stderr=sys.stderr,  # type: IO[Any]
+                versionfunc=versionstring,  # type: Callable[[], Text]
+                logger_handler=None,  #
+                custom_schema_callback=None,  # type: Callable[[], None]
+                executor=None,  # type: Callable[..., Tuple[Dict[Text, Any], Text]]
+                loadingContext=None,  # type: LoadingContext
+                runtimeContext=None  # type: RuntimeContext
+                ):  # type: (...) -> int
         if not stdout:  # force UTF-8 even if the console is configured differently
             if (hasattr(sys.stdout, "encoding")  # type: ignore
                 and sys.stdout.encoding != 'UTF-8'):  # type: ignore
@@ -98,6 +135,9 @@ class cwl_kernel(Kernel):
                 if argsl is None:
                     argsl = sys.argv[1:]
                 args = arg_parser().parse_args(argsl)
+                if args.workflow and "--outdir" not in argsl:
+                    outputPath = args.workflow.split('/')[-1].split('.')[0]
+                    setattr(args,"outdir", os.getcwd()+"/"+outputPath+"/"+datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S'))
 
             if runtimeContext is None:
                 runtimeContext = RuntimeContext(vars(args))
@@ -132,14 +172,14 @@ class cwl_kernel(Kernel):
                 stderr_handler.setFormatter(formatter)
 
             if args.version:
-                print(versionfunc())
-                return 0
+                # print(versionfunc())
+                return versionfunc(), 0
             else:
                 _logger.info(versionfunc())
 
             if args.print_supported_versions:
-                print("\n".join(supportedCWLversions(args.enable_dev)))
-                return 0
+                # print("\n".join(supportedCWLversions(args.enable_dev)))
+                return "\n".join(supportedCWLversions(args.enable_dev)), 0
 
             if not args.workflow:
                 if os.path.isfile("CWLFile"):
@@ -197,8 +237,9 @@ class cwl_kernel(Kernel):
                     fetcher_constructor=loadingContext.fetcher_constructor)
 
                 if args.print_deps:
-                    printdeps(workflowobj, document_loader, stdout, args.relative_deps, uri)
-                    return 0
+                    # printdeps(workflowobj, document_loader, stdout, args.relative_deps, uri)
+                    result = returndeps(workflowobj, document_loader, stdout, args.relative_deps, uri)
+                    return result, 0
 
                 document_loader, avsc_names, processobj, metadata, uri \
                     = validate_document(document_loader, workflowobj, uri,
@@ -211,8 +252,8 @@ class cwl_kernel(Kernel):
                                         do_validate=loadingContext.do_validate)
 
                 if args.print_pre:
-                    stdout.write(json_dumps(processobj, indent=4))
-                    return 0
+                    # stdout.write(json_dumps(processobj, indent=4))
+                    return json_dumps(processobj, indent=4), 0
 
                 loadingContext.overrides_list.extend(metadata.get("cwltool:overrides", []))
 
@@ -222,23 +263,23 @@ class cwl_kernel(Kernel):
                     yaml.safe_dump(generate_input_template(tool), sys.stdout,
                                    default_flow_style=False, indent=4,
                                    block_seq_indent=2)
-                    return 0
+                    return yaml.safe_dump(generate_input_template(tool), indent=4), 0
 
                 if args.validate:
                     _logger.info("Tool definition is valid")
-                    return 0
+                    return "Tool definition is valid", 0
 
                 if args.pack:
                     stdout.write(print_pack(document_loader, processobj, uri, metadata))
-                    return 0
+                    return print_pack(document_loader, processobj, uri, metadata), 0
 
                 if args.print_rdf:
                     stdout.write(printrdf(tool, document_loader.ctx, args.rdf_serializer))
-                    return 0
+                    return printrdf(tool, document_loader.ctx, args.rdf_serializer), 0
 
                 if args.print_dot:
                     printdot(tool, document_loader.ctx, stdout)
-                    return 0
+                    return "args.print_dot still not solved",0
 
             except (validate.ValidationException) as exc:
                 _logger.error(u"Tool definition failed validation:\n%s", exc,
@@ -257,7 +298,7 @@ class cwl_kernel(Kernel):
                 return 1
 
             if isinstance(tool, int):
-                return tool
+                return tool, 0
 
             # If on MacOS platform, TMPDIR must be set to be under one of the
             # shared volumes in Docker for Mac
@@ -324,11 +365,11 @@ class cwl_kernel(Kernel):
                     functools.partial(find_default_container, args)
                 runtimeContext.make_fs_access = getdefault(runtimeContext.make_fs_access, StdFsAccess)
 
+
                 (out, status) = executor(tool,
                                          initialized_job_order_object,
                                          runtimeContext,
                                          logger=_logger)
-
                 # This is the workflow output, it needs to be written
                 if out is not None:
 
@@ -358,7 +399,7 @@ class cwl_kernel(Kernel):
                     return 1
 
                 _logger.info(u"Final process status is %s", status)
-                return out,"success"
+                return out, status
 
             except (validate.ValidationException) as exc:
                 _logger.error(u"Input object failed validation:\n%s", exc,
@@ -385,79 +426,35 @@ class cwl_kernel(Kernel):
 
 
     def do_execute(self, code, silent, store_history=True,
-                   user_expressions=None, allow_stdin=False):
-
+                   user_expressions=None, allow_stdin=None, timeout=60):
         sys.argv[1] = None
         sys.stderr = sys.__stderr__
-        # code = code.encode('unicode-escape').decode('string_escape')
-        if code in ['clear','new']:
-            self.PREINPUT = []
+        inputs = code.split()
+        outputs = ""
         if not silent:
-            inputfield = code.split()
-            # 遍历输入域
-            for item in inputfield:
-                if os.path.splitext(item)[1] == '.cwl':
-                    # 更新CWL文件
-                    self.CWLFILEPATH = item
-            # 输入域和记录中都没有cwl文件，则在数据文件中寻找cwl地址
-            if not self.CWLFILEPATH:
-                for item in inputfield:
-                    if os.path.splitext(item)[1] in [".yaml", ".json"]:
-                        try:
-                            f = open(item,'r')
-                            text = f.read()
-                            if 'cwl:tool' in text:
-                            # 自动导入CWL的数据文件
-                            # 抹掉CWL记录
-                                self.CWLFILEPATH = "cwl:tool"
-                        except IOError as e:
-                            _logger.error('data file cannot open')
+            result, status = self.cwlmain(inputs)
+            if status == 0:
+                outputs = str(result)
+
+            elif isinstance(result, dict):
+                for keys in result:
+                    filename = keys
+                    filepath = result[filename]['path']
+                    f = open(filepath,"r")
+                    context = f.read()
+                    if len(context)>1000:
+                        displayContext = filepath
                     else:
-                        self.PREINPUT.append(item)
+                        displayContext = context
+                    outputs = outputs+"\n"+displayContext +"\n\n"+ status
 
-            # 如果有记录，而且inputfiled里面没有cwl，加入cwl
-            elif self.CWLFILEPATH:
-                if self.CWLFILEPATH not in inputfield and self.CWLFILEPATH != "cwl:tool":
-                    inputfield.insert(0, self.CWLFILEPATH)
-                for i in self.PREINPUT:
-                    inputfield.append(i)
-            if self.CWLFILEPATH:
-                result,status = self.cwlmain(inputfield)
-            else:
-                result = "data file/ cwl file required."
-                status = "error"
-            print('finished!!')
-            if status == "success":
-                self.PREINPUT = []
-                contents = result
-            else:
-                contents = result
-
-            # output: File
-            # open output file
-
-            if isinstance(contents,dict) and status == "success":
-                for file in contents:
-                    if isinstance(contents[file], dict):
-                        filepath = contents[file]['path']
-                        f = open(filepath, 'r')
-                        text = f.read()
-                        if len(text)>1000:
-                            output = text[:1000] + "\n" + contents[file]['path'] + "\n\n"
-                        else:
-                            output = text
-            else:
-                output = contents
-
-            stream_content = {'name': 'stdout', 'text': output}
+            stream_content = {'name': 'stdout', 'text': outputs}
             self.send_response(self.iopub_socket, 'stream', stream_content)
-
 
         return {'status': 'ok',
                 'execution_count': self.execution_count,
                 'payload': [],
                 'user_expressions': {},
-                }
-
+               }
 
 
