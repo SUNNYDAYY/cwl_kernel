@@ -97,8 +97,7 @@ class cwl_kernel(Kernel):
     }
 
     banner = "cwlKernel"
-    CWLFILEPATH = None
-    PREINPUT = []
+    VARIABLELIST = {}
 
     def cwlmain(self,
                 argsl=None,  # type: List[str]
@@ -429,24 +428,59 @@ class cwl_kernel(Kernel):
                    user_expressions=None, allow_stdin=None, timeout=60):
         sys.argv[1] = None
         sys.stderr = sys.__stderr__
-        inputs = code.split()
+        inputs = code.strip().split()
         outputs = ""
-        if not silent:
-            result, status = self.cwlmain(inputs)
-            if status == 0:
-                outputs = str(result)
+        Vname = None
 
-            elif isinstance(result, dict):
-                for keys in result:
-                    filename = keys
-                    filepath = result[filename]['path']
-                    f = open(filepath,"r")
-                    context = f.read()
-                    if len(context)>1000:
-                        displayContext = filepath
-                    else:
-                        displayContext = context
-                    outputs = outputs+"\n"+displayContext +"\n\n"+ status
+        if not silent:
+            # operation: ls(show all variables), i(show value of i), clear(delete all variables)
+            if len(inputs) == 1 and "." not in inputs[0]:
+                if inputs[0] == "ls":
+                    outputs = str(self.VARIABLELIST)
+                elif inputs[0] in self.VARIABLELIST.keys():
+                    # ?
+                    try:
+                        outputs = str(self.VARIABLELIST.get(inputs[0]))
+                    except:
+                        outputs = "can't find variable"+inputs[0]+"."
+                        status = 1
+                elif inputs[0] == "clear":
+                    self.VARIABLELIST.clear()
+                elif "-" in inputs[0]:
+                    outputs, status = self.cwlmain(inputs)
+                else:
+                    outputs = "can't find operation"+inputs[0]+"."
+                    status = 1
+            # operation: del i
+            elif inputs[0] == "del":
+                try:
+                    self.VARIABLELIST.pop(inputs[1])
+                except:
+                    outputs = "can't find variable"+inputs[1]+"."
+                    status = 1
+            # store variable name
+            else:
+                if "=" in inputs[0] and "-" not in inputs[0]:
+                    Vname = inputs[0].split('=')[0]
+                    del inputs[0]
+                result, status = self.cwlmain(inputs)
+                # display version
+                if status == 0:
+                    outputs = str(result)
+                # running result
+                elif isinstance(result, dict):
+                    # 只有一个结果
+                    for keys in result:
+                        if isinstance(result[keys],dict):
+                            result = json_dumps(result, indent=4)
+                            outputs = outputs + "\n" + result + "\n" + status
+                        else:
+                            if Vname:
+                                self.VARIABLELIST[Vname] = result[keys]
+                                Vname = None
+                            outputs = str(result[keys])
+
+
 
             stream_content = {'name': 'stdout', 'text': outputs}
             self.send_response(self.iopub_socket, 'stream', stream_content)
