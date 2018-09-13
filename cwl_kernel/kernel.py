@@ -2,8 +2,9 @@
 import argparse
 import codecs
 import sys
+import uuid
 
-import io
+
 import six
 import logging
 import os
@@ -43,10 +44,6 @@ from cwltool.utils import onWindows, windows_default_container_id, json_dumps
 from cwltool.main import supportedCWLversions, printdeps, find_default_container, generate_input_template, print_pack, versionstring,init_job_order, load_job_order
 from cwltool.secrets import SecretStore
 from cwltool.main import make_relative
-from cwltool.cwlrdf import dot_with_parameters, dot_without_parameters
-from cwltool.factory import Factory
-
-from metakernel import MetaKernel
 
 from ipykernel.kernelbase import Kernel
 
@@ -98,6 +95,7 @@ class cwl_kernel(Kernel):
 
     banner = "cwlKernel"
     VARIABLELIST = {}
+    tempfilelist = []
 
     def cwlmain(self,
                 argsl=None,  # type: List[str]
@@ -113,16 +111,9 @@ class cwl_kernel(Kernel):
                 loadingContext=None,  # type: LoadingContext
                 runtimeContext=None  # type: RuntimeContext
                 ):  # type: (...) -> int
-        if not stdout:  # force UTF-8 even if the console is configured differently
-            if (hasattr(sys.stdout, "encoding")  # type: ignore
-                and sys.stdout.encoding != 'UTF-8'):  # type: ignore
-                if six.PY3 and hasattr(sys.stdout, "detach"):
-                    stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-                else:
-                    stdout = codecs.getwriter('utf-8')(sys.stdout)  # type: ignore
-            else:
-                stdout = cast(TextIO, sys.stdout)  # type: ignore
 
+        if not stdout:
+            stdout = codecs.getwriter('utf-8')(sys.stdout)
         _logger.removeHandler(defaultStreamHandler)
         if logger_handler:
             stderr_handler = logger_handler
@@ -131,31 +122,14 @@ class cwl_kernel(Kernel):
         _logger.addHandler(stderr_handler)
         try:
             if args is None:
-                if argsl is None:
-                    argsl = sys.argv[1:]
                 args = arg_parser().parse_args(argsl)
                 if args.workflow and "--outdir" not in argsl:
                     outputPath = args.workflow.split('/')[-1].split('.')[0]
-                    setattr(args,"outdir", os.getcwd()+"/"+outputPath+"/"+datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S'))
-
+                    setattr(args,"outdir", os.getcwd()+"/"+outputPath+"/"+datetime.datetime.now().strftime('%Y-%m-%d-%H%M'))
             if runtimeContext is None:
                 runtimeContext = RuntimeContext(vars(args))
             else:
                 runtimeContext = runtimeContext.copy()
-
-            # If on Windows platform, a default Docker Container is used if not
-            # explicitely provided by user
-            if onWindows() and not runtimeContext.default_container:
-                # This docker image is a minimal alpine image with bash installed
-                # (size 6 mb). source: https://github.com/frol/docker-alpine-bash
-                runtimeContext.default_container = windows_default_container_id
-
-            # If caller parsed its own arguments, it may not include every
-            # cwltool option, so fill in defaults to avoid crashing when
-            # dereferencing them in args.
-            for key, val in six.iteritems(get_default_args()):
-                if not hasattr(args, key):
-                    setattr(args, key, val)
 
             rdflib_logger = logging.getLogger("rdflib.term")
             rdflib_logger.addHandler(stderr_handler)
@@ -169,15 +143,13 @@ class cwl_kernel(Kernel):
                 formatter = logging.Formatter("[%(asctime)s] %(message)s",
                                               "%Y-%m-%d %H:%M:%S")
                 stderr_handler.setFormatter(formatter)
-
+            # version
             if args.version:
-                # print(versionfunc())
                 return versionfunc(), 0
             else:
                 _logger.info(versionfunc())
 
             if args.print_supported_versions:
-                # print("\n".join(supportedCWLversions(args.enable_dev)))
                 return "\n".join(supportedCWLversions(args.enable_dev)), 0
 
             if not args.workflow:
@@ -187,7 +159,7 @@ class cwl_kernel(Kernel):
                     _logger.error("")
                     _logger.error("CWL document required, no input file was provided")
                     arg_parser().print_help()
-                    return 1
+                    return "CWL document required, no input file was provided",1
             if args.relax_path_checks:
                 command_line_tool.ACCEPTLIST_RE = command_line_tool.ACCEPTLIST_EN_RELAXED_RE
 
@@ -215,10 +187,12 @@ class cwl_kernel(Kernel):
             loadingContext.construct_tool_object = getdefault(loadingContext.construct_tool_object,
                                                               workflow.default_make_tool)
             loadingContext.resolver = getdefault(loadingContext.resolver, tool_resolver)
-
-            uri, tool_file_uri = resolve_tool_uri(args.workflow,
+            try:
+                uri, tool_file_uri = resolve_tool_uri(args.workflow,
                                                   resolver=loadingContext.resolver,
                                                   fetcher_constructor=loadingContext.fetcher_constructor)
+            except:
+                return "Can't find file "+ args.workflow, 0
 
             try_again_msg = "" if args.debug else ", try again with --debug for more information"
 
@@ -230,6 +204,7 @@ class cwl_kernel(Kernel):
                 if args.overrides:
                     loadingContext.overrides_list.extend(load_overrides(
                         file_uri(os.path.abspath(args.overrides)), tool_file_uri))
+
 
                 document_loader, workflowobj, uri = fetch_document(
                     uri, resolver=loadingContext.resolver,
@@ -283,18 +258,20 @@ class cwl_kernel(Kernel):
             except (validate.ValidationException) as exc:
                 _logger.error(u"Tool definition failed validation:\n%s", exc,
                               exc_info=args.debug)
-                return 1
+                infor = "Tool definition failed validation:\n%s"+exc+args.debug
+                return infor,1
             except (RuntimeError, WorkflowException) as exc:
                 _logger.error(u"Tool definition failed initialization:\n%s", exc,
                               exc_info=args.debug)
-                return 1
+                infor = "Tool definition failed initialization:\n%s"+exc+args.debug
+                return infor,1
             except Exception as exc:
                 _logger.error(
                     u"I'm sorry, I couldn't load this CWL file%s.\nThe error was: %s",
                     try_again_msg,
                     exc if not args.debug else "",
                     exc_info=args.debug)
-                return 1
+                return "I'm sorry, I couldn't load this CWL file",1
 
             if isinstance(tool, int):
                 return tool, 0
@@ -318,7 +295,8 @@ class cwl_kernel(Kernel):
                             os.makedirs(os.path.dirname(getattr(runtimeContext, dirprefix)))
                         except Exception as e:
                             _logger.error("Failed to create directory: %s", e)
-                            return 1
+                            infor = "Failed to create directory: %s"+e+""
+                            return infor, 1
 
             if args.cachedir:
                 if args.move_outputs == "move":
@@ -327,7 +305,6 @@ class cwl_kernel(Kernel):
 
             runtimeContext.secret_store = getdefault(runtimeContext.secret_store, SecretStore())
 
-            initialized_job_order_object = 255  # type: Union[MutableMapping[Text, Any], int]
             try:
                 initialized_job_order_object = init_job_order(job_order_object, args, tool,
                                                               jobloader, stdout,
@@ -337,7 +314,6 @@ class cwl_kernel(Kernel):
                                                               secret_store=runtimeContext.secret_store)
             except SystemExit as err:
                 return err.code
-
             if not executor:
                 if args.parallel:
                     executor = MultithreadedJobExecutor()
@@ -395,7 +371,8 @@ class cwl_kernel(Kernel):
 
                 if status != "success":
                     _logger.warning(u"Final process status is %s", status)
-                    return 1
+                    infor = "Final process status is %s"+status+""
+                    return infor,1
 
                 _logger.info(u"Final process status is %s", status)
                 return out, status
@@ -403,21 +380,25 @@ class cwl_kernel(Kernel):
             except (validate.ValidationException) as exc:
                 _logger.error(u"Input object failed validation:\n%s", exc,
                               exc_info=args.debug)
-                return 1
+                infor = "Input object failed validation:\n%s"+ exc + args.debug
+                return infor, 1
             except UnsupportedRequirement as exc:
                 _logger.error(
                     u"Workflow or tool uses unsupported feature:\n%s", exc,
                     exc_info=args.debug)
-                return 33
+                infor = "Workflow or tool uses unsupported feature:\n%s"+exc+ args.debug
+                return infor, 3
             except WorkflowException as exc:
                 _logger.error(
                     u"Workflow error%s:\n%s", try_again_msg, strip_dup_lineno(six.text_type(exc)),
                     exc_info=args.debug)
-                return 1
+                infor = "Workflow error%s:\n%s"+try_again_msg+strip_dup_lineno(six.text_type(exc))+args.debug
+                return infor, 1
             except Exception as exc:
                 _logger.error(
                     u"Unhandled error%s:\n  %s", try_again_msg, exc, exc_info=args.debug)
-                return 1
+                infor = "Unhandled error%s:\n  %s" + try_again_msg + exc + args.debug
+                return infor, 1
 
         finally:
             _logger.removeHandler(stderr_handler)
@@ -430,57 +411,102 @@ class cwl_kernel(Kernel):
         sys.stderr = sys.__stderr__
         inputs = code.strip().split()
         outputs = ""
-        Vname = None
+        vname = None
 
         if not silent:
+            if code.strip() in ['quit', 'quit()', 'exit', 'exit()']:
+                self.do_shutdown(True)
+                execution_count = "-"
+                return {'status': 'ok',
+                        'execution_count': execution_count,
+                        }
+            if code.strip().startswith("'"):
+                stream_content = {'name': 'stdout', 'text': code}
+                self.send_response(self.iopub_socket, 'stream', stream_content)
+                execution_count = "comment"
+                return{
+                    'status': 'ok',
+                    'execution_count': execution_count,
+                    }
+
             # operation: ls(show all variables), i(show value of i), clear(delete all variables)
+
             if len(inputs) == 1 and "." not in inputs[0]:
                 if inputs[0] == "ls":
                     outputs = str(self.VARIABLELIST)
                 elif inputs[0] in self.VARIABLELIST.keys():
-                    # ?
                     try:
                         outputs = str(self.VARIABLELIST.get(inputs[0]))
                     except:
-                        outputs = "can't find variable"+inputs[0]+"."
+                        outputs = "can't find variable "+inputs[0]+"."
                         status = 1
                 elif inputs[0] == "clear":
                     self.VARIABLELIST.clear()
                 elif "-" in inputs[0]:
-                    outputs, status = self.cwlmain(inputs)
+                    try:
+                        outputs, status = self.cwlmain(inputs)
+                    except:
+                        self.do_shutdown(True)
+                        stream_content = {'name': 'stdout', 'text': outputs}
+                        self.send_response(self.iopub_socket, 'stream', stream_content)
+                        ename = "unrecognized arguments:"+inputs[0]
+                        return{
+                            'status': 'error',
+                            'ename': ename,  # Exception name, as a string
+                            'evalue': "",  # Exception value, as a string
+                            'traceback': [""],  # traceback frames as strings
+                        }
                 else:
-                    outputs = "can't find operation"+inputs[0]+"."
+                    outputs = "can't find operation "+inputs[0]+"."
                     status = 1
             # operation: del i
             elif inputs[0] == "del":
                 try:
+                    if isinstance(self.VARIABLELIST[inputs[1]], dict):
+                        os.remove(self.VARIABLELIST[inputs[1]]["tempFilePath"])
                     self.VARIABLELIST.pop(inputs[1])
+
                 except:
-                    outputs = "can't find variable"+inputs[1]+"."
+                    outputs = "can't find variable "+inputs[1]+"."
                     status = 1
             # store variable name
             else:
                 if "=" in inputs[0] and "-" not in inputs[0]:
-                    Vname = inputs[0].split('=')[0]
+                    vname = inputs[0].split('=')[0]
                     del inputs[0]
+                for items in inputs:
+                    if items in self.VARIABLELIST:
+                        if isinstance(self.VARIABLELIST[items],dict):
+                            inputs[inputs.index(items)] = str(self.VARIABLELIST[items]["tempFilePath"])
+                        else:
+                            inputs[inputs.index(items)] = str(self.VARIABLELIST[items])
                 result, status = self.cwlmain(inputs)
                 # display version
                 if status == 0:
                     outputs = str(result)
                 # running result
                 elif isinstance(result, dict):
-                    # 只有一个结果
+                    # 结果为file
                     for keys in result:
                         if isinstance(result[keys],dict):
-                            result = json_dumps(result, indent=4)
-                            outputs = outputs + "\n" + result + "\n" + status
+                            JsonResult = json_dumps(result, indent=4)
+                            outputs = outputs + "\n" + JsonResult + "\n" + status
+                            if vname:
+                                tempPath = os.getcwd() + "/"+ str(uuid.uuid4()) + ".txt"
+                                tempFile = open(tempPath, "w")
+                                try:
+                                    tempFile.write(str(result[keys]))
+                                    self.tempfilelist.append(tempPath)
+                                    result[keys]["tempFilePath"] = tempPath
+                                    self.VARIABLELIST[vname] = result[keys]
+                                finally:
+                                    tempFile.close()
+
+                        # 结果是int string
                         else:
-                            if Vname:
-                                self.VARIABLELIST[Vname] = result[keys]
-                                Vname = None
+                            if vname:
+                                self.VARIABLELIST[vname] = result[keys]
                             outputs = str(result[keys])
-
-
 
             stream_content = {'name': 'stdout', 'text': outputs}
             self.send_response(self.iopub_socket, 'stream', stream_content)
